@@ -60,10 +60,11 @@ cargo run --release
 
 ## Checkpoint / Resume
 
-- `artifacts/checkpoint.json` tracks: `epochs_done`, `total_epochs`, `best_perplexity`
-- On restart: loads model from `artifacts/model.bin`, calculates remaining epochs
+- `artifacts/checkpoint.json` tracks: `epochs_done`, `total_epochs` (auto-saved after `run()`)
+- On restart: reads `checkpoint.json`, calculates `remaining = total - done`, trains only remaining
+- Model weights loaded from `artifacts/model` (saved at end of each `run()`)
 - Adam optimizer starts fresh each run (momentum rebuilds quickly)
-- Delete `artifacts/checkpoint.json` to force fresh training
+- Delete `artifacts/checkpoint.json` to force full retraining from epoch 1
 
 ## Key Burn 0.21 API Notes
 

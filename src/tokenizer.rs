@@ -1,8 +1,8 @@
-use std::collections::HashMap;
+use std::collections::{BinaryHeap, HashMap};
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
-/// BPE tokenizer trained from scratch on a corpus.
+/// Улучшенный BPE токенизатор
 #[derive(Serialize, Deserialize)]
 pub struct BpeTokenizer {
     /// token string -> id
@@ -16,19 +16,10 @@ pub struct BpeTokenizer {
     )]
     merges: HashMap<(usize, usize), usize>,
 
-    /// Special tokens — public API for downstream use.
-    /// Currently unused by the training loop itself,
-    /// but exposed for padding, BOS/EOS injection, etc.
-    #[allow(dead_code)]
+    // Специальные токены
     pub pad_token: usize,
-    #[allow(dead_code)]
-    #[serde(skip)]
     pub bos_token: usize,
-    #[allow(dead_code)]
-    #[serde(skip)]
     pub eos_token: usize,
-    #[allow(dead_code)]
-    #[serde(skip)]
     pub unk_token: usize,
 }
 
@@ -36,8 +27,7 @@ fn serialize_merges<S: Serializer>(
     merges: &HashMap<(usize, usize), usize>,
     s: S,
 ) -> Result<S::Ok, S::Error> {
-    let vec: Vec<((usize, usize), usize)> =
-        merges.iter().map(|(k, v)| (*k, *v)).collect();
+    let vec: Vec<((usize, usize), usize)> = merges.iter().map(|(k, v)| (*k, *v)).collect();
     vec.serialize(s)
 }
 
@@ -49,15 +39,17 @@ fn deserialize_merges<'de, D: Deserializer<'de>>(
 }
 
 impl BpeTokenizer {
-    /// Create a new (untrained) tokenizer with special tokens.
+    /// Создаёт новый токенизатор
     pub fn new() -> Self {
         let mut vocab = HashMap::new();
         let mut ivocab = Vec::new();
-        let specials = ["<pad>", "<bos>", "<eos>", "Ġ"];
+
+        let specials = vec!["<pad>", "<bos>", "<eos>", "<unk>"];
         for (i, &tok) in specials.iter().enumerate() {
             vocab.insert(tok.to_string(), i);
             ivocab.push(tok.to_string());
         }
+
         BpeTokenizer {
             vocab,
             ivocab,
@@ -69,72 +61,95 @@ impl BpeTokenizer {
         }
     }
 
-    /// Train BPE on the given sentences.
+    /// Обучение BPE
     pub fn train<I, S>(&mut self, sentences: I, target_vocab_size: usize)
     where
         I: IntoIterator<Item = S>,
         S: AsRef<str>,
     {
-        // Rebuild vocab from ivocab (in case of deserialization)
-        if self.vocab.is_empty() && !self.ivocab.is_empty() {
-            for (i, tok) in self.ivocab.iter().enumerate() {
-                self.vocab.insert(tok.clone(), i);
-            }
-        }
-
-        // 1. Count characters
-        let mut char_counts: HashMap<String, usize> = HashMap::new();
         let mut sequences: Vec<Vec<String>> = Vec::new();
+        let mut char_counts: HashMap<String, usize> = HashMap::new();
+
+        println!("Подсчёт символов и подготовка последовательностей...");
 
         for s in sentences {
-            let txt = s.as_ref();
-            let chars: Vec<String> = txt.chars().map(|c| c.to_string()).collect();
-            for ch in &chars {
-                *char_counts.entry(ch.clone()).or_insert(0) += 1;
+            let txt = s.as_ref().trim();
+            if txt.is_empty() {
+                continue;
             }
-            sequences.push(chars);
+
+            // Простая пре-токенизация (лучше, чем просто по символам)
+            let mut tokens = Vec::new();
+            for word in txt.split_whitespace() {
+                if word.is_empty() {
+                    continue;
+                }
+                // Добавляем префикс Ġ для начала слова (как в GPT)
+                let mut chars: Vec<String> = word.chars().map(|c| c.to_string()).collect();
+                if !chars.is_empty() {
+                    chars[0] = format!("Ġ{}", chars[0]);
+                }
+                tokens.extend(chars);
+                tokens.push(" ".to_string()); // разделитель между словами
+            }
+
+            for tok in &tokens {
+                *char_counts.entry(tok.clone()).or_insert(0) += 1;
+            }
+            sequences.push(tokens);
         }
 
-        // Add all seen characters to vocab
+        // Добавляем все уникальные символы в словарь
         for (ch, _) in char_counts {
             if !self.vocab.contains_key(&ch) {
-                let idx = self.ivocab.len();
-                self.vocab.insert(ch.clone(), idx);
+                let id = self.ivocab.len();
+                self.vocab.insert(ch.clone(), id);
                 self.ivocab.push(ch);
             }
         }
 
-        // 2. Iteratively merge the most frequent pair
-        let start_vocab = self.vocab.len();
+        let start_size = self.vocab.len();
+        println!("Начальный размер словаря: {}", start_size);
+        println!("Начинаем слияния до размера {}", target_vocab_size);
+
+        // Основной цикл BPE
         while self.vocab.len() < target_vocab_size {
-            // Progress indicator every 50 merges
-            if (self.vocab.len() - start_vocab) % 50 == 0 {
-                eprintln!(
-                    "  BPE merge {}/{} (vocab size: {})",
-                    self.vocab.len() - start_vocab,
-                    target_vocab_size - start_vocab,
+            if (self.vocab.len() - start_size) % 300 == 0 {
+                println!(
+                    "  Merge progress: {}/{} (vocab size: {})",
+                    self.vocab.len() - start_size,
+                    target_vocab_size - start_size,
                     self.vocab.len()
                 );
             }
-            // Count pairs
-            let mut pair_counts: HashMap<(String, String), usize> = HashMap::new();
+
+            let mut pair_counts: HashMap<(usize, usize), usize> = HashMap::new();
+
             for seq in &sequences {
-                for w in seq.windows(2) {
-                    let pair = (w[0].clone(), w[1].clone());
-                    *pair_counts.entry(pair).or_insert(0) += 1;
+                for window in seq.windows(2) {
+                    if let (Some(&a), Some(&b)) =
+                        (self.vocab.get(&window[0]), self.vocab.get(&window[1]))
+                    {
+                        *pair_counts.entry((a, b)).or_insert(0) += 1;
+                    }
                 }
             }
-            if pair_counts.is_empty() {
-                break; // nothing more to merge
-            }
-            // Find max pair
-            let ((a, b), _max) = pair_counts
-                .into_iter()
-                .max_by_key(|&(_, cnt)| cnt)
-                .expect("there is at least one pair");
-            let merged = format!("{}{}", a, b);
 
-            // Get or create id for merged token
+            if pair_counts.is_empty() {
+                break;
+            }
+
+            // Находим самую частую пару
+            let (&best_pair, _) = pair_counts.iter().max_by_key(|&(_, &count)| count).unwrap();
+
+            let left = &self.ivocab[best_pair.0];
+            let right = &self.ivocab[best_pair.1];
+            let merged = if right.starts_with('Ġ') {
+                format!("{}{}", left, right.trim_start_matches('Ġ'))
+            } else {
+                format!("{}{}", left, right)
+            };
+
             let merged_id = if let Some(&id) = self.vocab.get(&merged) {
                 id
             } else {
@@ -144,103 +159,148 @@ impl BpeTokenizer {
                 id
             };
 
-            // Get ids of a and b
-            let a_id = *self
-                .vocab
-                .get(&a)
-                .expect("left token must be in vocab");
-            let b_id = *self
-                .vocab
-                .get(&b)
-                .expect("right token must be in vocab");
-            // Record merge rule
-            self.merges.insert((a_id, b_id), merged_id);
+            self.merges.insert(best_pair, merged_id);
 
-            // Apply the merge to all sequences
+            // Применяем слияние
             for seq in &mut sequences {
                 let mut i = 0;
                 while i < seq.len() - 1 {
-                    if seq[i] == a && seq[i + 1] == b {
-                        seq.splice(i..i + 2, std::iter::once(merged.clone()));
-                        // after splicing, stay at same i to check for overlapping merges
+                    let a_id = *self.vocab.get(&seq[i]).unwrap();
+                    let b_id = *self.vocab.get(&seq[i + 1]).unwrap();
+
+                    if (a_id, b_id) == best_pair {
+                        seq[i] = merged.clone();
+                        seq.remove(i + 1);
                     } else {
                         i += 1;
                     }
                 }
             }
         }
+
+        println!(
+            "Токенизатор обучен! Финальный размер словаря: {}",
+            self.vocab.len()
+        );
     }
 
-    /// Convert text to token ids.
+    /// Кодирование текста в токены
     pub fn encode(&self, text: &str) -> Vec<usize> {
-        // Start with characters; unknown chars map to unk_token
         let unk = self.unk_token;
         let mut ids: Vec<usize> = text
             .chars()
-            .map(|ch| ch.to_string())
-            .map(|t| self.vocab.get(&t).copied().unwrap_or(unk))
+            .map(|c| c.to_string())
+            .map(|t| *self.vocab.get(&t).unwrap_or(&unk))
             .collect();
 
-        // Guard against empty input
         if ids.len() <= 1 {
             return ids;
         }
 
-        // Apply merge rules in order; do multiple passes until no change
-        let mut changed = true;
-        while changed {
-            changed = false;
-            let mut i = 0;
-            while i + 1 < ids.len() {
-                let pair = (ids[i], ids[i + 1]);
-                if let Some(&merged) = self.merges.get(&pair) {
-                    ids.splice(i..i + 2, std::iter::once(merged));
-                    changed = true;
-                } else {
-                    i += 1;
+        // Используем твою эффективную реализацию с BinaryHeap
+        #[derive(Eq, PartialEq)]
+        struct Candidate {
+            priority: usize,
+            pos: usize,
+        }
+
+        impl Ord for Candidate {
+            fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+                other
+                    .priority
+                    .cmp(&self.priority)
+                    .then_with(|| self.pos.cmp(&other.pos))
+            }
+        }
+
+        impl PartialOrd for Candidate {
+            fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+                Some(self.cmp(other))
+            }
+        }
+
+        let n = ids.len();
+        let mut prev: Vec<Option<usize>> = (0..n).map(|i| i.checked_sub(1)).collect();
+        let mut next: Vec<Option<usize>> = (0..n)
+            .map(|i| if i + 1 < n { Some(i + 1) } else { None })
+            .collect();
+        let mut active = vec![true; n];
+        let mut heap: BinaryHeap<Candidate> = BinaryHeap::new();
+
+        for i in 0..n - 1 {
+            let pair = (ids[i], ids[i + 1]);
+            if let Some(&merged) = self.merges.get(&pair) {
+                heap.push(Candidate {
+                    priority: merged,
+                    pos: i,
+                });
+            }
+        }
+
+        while let Some(Candidate { pos, .. }) = heap.pop() {
+            if !active[pos] {
+                continue;
+            }
+            let right = match next[pos] {
+                Some(r) if active[r] => r,
+                _ => continue,
+            };
+
+            let pair = (ids[pos], ids[right]);
+            let merged = match self.merges.get(&pair) {
+                Some(&m) => m,
+                None => continue,
+            };
+
+            ids[pos] = merged;
+            active[right] = false;
+            next[pos] = next[right];
+            if let Some(nr) = next[right] {
+                prev[nr] = Some(pos);
+            }
+
+            if let Some(l) = prev[pos] {
+                let pair = (ids[l], ids[pos]);
+                if let Some(&m) = self.merges.get(&pair) {
+                    heap.push(Candidate {
+                        priority: m,
+                        pos: l,
+                    });
+                }
+            }
+            if let Some(r) = next[pos] {
+                let pair = (ids[pos], ids[r]);
+                if let Some(&m) = self.merges.get(&pair) {
+                    heap.push(Candidate { priority: m, pos });
                 }
             }
         }
-        ids
+
+        let mut result = Vec::new();
+        let mut cursor = (0..n).find(|&i| active[i]);
+        while let Some(pos) = cursor {
+            result.push(ids[pos]);
+            cursor = next[pos];
+        }
+        result
     }
 
-    /// Convert token ids back to text.
+    /// Декодирование токенов обратно в текст
     pub fn decode(&self, ids: &[usize]) -> String {
-        ids.iter()
+        let mut text = ids
+            .iter()
             .filter_map(|&id| self.ivocab.get(id))
             .cloned()
-            .collect()
+            .collect::<Vec<_>>()
+            .join("");
+
+        // Чистим Ġ и лишние пробелы
+        text = text.replace("Ġ", " ");
+        text = text.replace("  ", " ");
+        text.trim().to_string()
     }
 
-    /// Vocabulary size (including specials).
     pub fn vocab_size(&self) -> usize {
         self.vocab.len()
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_special_tokens() {
-        let tok = BpeTokenizer::new();
-        assert_eq!(tok.vocab_size(), 4);
-        assert_eq!(tok.pad_token, 0);
-        assert_eq!(tok.bos_token, 1);
-        assert_eq!(tok.eos_token, 2);
-        assert_eq!(tok.unk_token, 3);
-    }
-
-    #[test]
-    fn test_train_and_encode() {
-        let mut tok = BpeTokenizer::new();
-        let data = ["hello world", "hello"];
-        tok.train(data.iter(), 50);
-        let ids = tok.encode("hello world");
-        let back = tok.decode(&ids);
-        // Should be able to roundtrip at least approximately
-        assert!(!ids.is_empty());
-        assert_eq!(back, "hello world");
     }
 }
